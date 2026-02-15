@@ -1,0 +1,27 @@
+name: ESPHome Logger
+version: "1.0.8"
+slug: esphome_logger
+description: Schreibt ESPHome Logs in Dateien
+arch:
+  - aarch64
+  - amd64
+  - armv7
+  - armhf
+  - i386
+init: false
+map:
+  - share:rw
+environment:
+  TZ: Europe/Berlin
+options:
+  devices:
+    - name: "device"
+      host: ""
+      password: ""
+      encryption_key: ""
+schema:
+  devices:
+    - name: str
+      host: str
+      password: str?
+      encryption_key: str?
