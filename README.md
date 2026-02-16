@@ -17,4 +17,4 @@ The Add-On writes all output from the configured ESPHome devices in local logfil
 You could also symlink the folder to /homeassistant/esphome/logs and access it via the VSCode Add-On.
 
 ### Disclaimer ###
-This Add-On has been created with the help of AI, but it does what it should.
+This Add-On has been created not only, but with the help of AI. So far I couldn't find any issues, but let me know, if you do.
