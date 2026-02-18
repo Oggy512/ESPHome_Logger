@@ -1,5 +1,5 @@
 name: ESPHome Logger
-version: "1.0.8"
+version: "1.0.9"
 slug: esphome_logger
 description: Schreibt ESPHome Logs in Dateien
 arch:
