@@ -40,25 +40,23 @@ LEVEL_MAP = {
 def strip_ansi_codes(text):
     """Entfernt ANSI-Farbcodes aus dem Text"""
     ansi_escape = re.compile(r'\x1b\[[0-9;]*m')
-    
     if isinstance(text, bytes):
         text = text.decode('utf-8', errors='ignore')
-    
     return ansi_escape.sub('', text)
 
 def rotate_log(log_file):
     """Rotiert Logfiles wenn Größe oder Zeilenanzahl überschritten"""
     if not log_file.exists():
         return
-    
+
     file_size = log_file.stat().st_size
-    
+
     with open(log_file, 'r', encoding='utf-8') as f:
         line_count = sum(1 for _ in f)
-    
+
     if file_size >= MAX_LOG_SIZE or line_count >= MAX_LOG_LINES:
         print(f"Rotiere {log_file.name} (Größe: {file_size} bytes, Zeilen: {line_count})")
-        
+
         for i in range(MAX_BACKUPS - 1, 0, -1):
             old_backup = Path(f"{log_file}.{i}")
             new_backup = Path(f"{log_file}.{i + 1}")
@@ -66,12 +64,12 @@ def rotate_log(log_file):
                 if new_backup.exists():
                     new_backup.unlink()
                 old_backup.rename(new_backup)
-        
+
         backup_file = Path(f"{log_file}.1")
         if backup_file.exists():
             backup_file.unlink()
         log_file.rename(backup_file)
-        
+
         print(f"Log rotiert zu {backup_file.name}")
 
 async def log_device(device_config):
@@ -79,17 +77,21 @@ async def log_device(device_config):
     host = device_config["host"]
     password = device_config.get("password", "")
     encryption_key = device_config.get("encryption_key", "")
-    
+
     log_file = LOG_DIR / f"{name}.log"
     line_counter = 0
-    
+
     print(f"[{name}] Verbinde mit {host}...")
     print(f"[{name}] Logfile: {log_file}")
-    
+
     reconnect_delay = 10
     client = None
-    
+
     while True:
+        # Event das gesetzt wird, sobald das Gerät die Verbindung trennt
+        # (z.B. durch OTA-Flash, Neustart, Stromausfall)
+        disconnected_event = asyncio.Event()
+
         try:
             # Erstelle neuen Client für jeden Verbindungsversuch
             if encryption_key:
@@ -101,35 +103,51 @@ async def log_device(device_config):
             else:
                 client = APIClient(host, 6053, "")
                 print(f"[{name}] Keine Authentifizierung")
-            
-            # Verbindung herstellen
-            await client.connect(login=True)
+
+            # Disconnect-Callback: wird von aioesphomeapi aufgerufen wenn
+            # die Verbindung verloren geht – egal ob durch OTA, Neustart oder Fehler.
+            # Ohne diesen Callback läuft die innere Schleife endlos weiter und
+            # es kommen trotz Trennung keine Logs mehr an.
+            def on_disconnect(expected_disconnect: bool) -> None:
+                reason = "erwartet (z.B. OTA/Flash)" if expected_disconnect else "unerwartet"
+                print(f"[{name}] Verbindung getrennt ({reason}). Starte Reconnect...")
+                try:
+                    now = datetime.now(LOCAL_TZ)
+                    with open(log_file, "a", encoding="utf-8") as f:
+                        f.write(f"# Verbindung getrennt ({reason}) um {now.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                except Exception:
+                    pass
+                # Innere Warteschleife beenden → Reconnect wird eingeleitet
+                disconnected_event.set()
+
+            # Verbindung herstellen und Disconnect-Callback registrieren
+            await client.connect(login=True, on_stop=on_disconnect)
             print(f"[{name}] Verbunden!")
             reconnect_delay = 10  # Reset bei erfolgreicher Verbindung
-            
+
             def on_log(msg):
                 nonlocal line_counter
-                
+
                 try:
                     now = datetime.now(LOCAL_TZ)
                     timestamp = now.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
                     level = LEVEL_MAP.get(msg.level, "UNKNOWN")
-                    
+
                     message = strip_ansi_codes(msg.message)
-                    
+
                     log_line = f"[{timestamp}] [{level:13s}] {message}\n"
-                    
+
                     if line_counter % 100 == 0 and line_counter > 0:
                         rotate_log(log_file)
-                    
+
                     with open(log_file, "a", encoding="utf-8") as f:
                         f.write(log_line)
-                    
+
                     line_counter += 1
-                    
+
                 except Exception as e:
                     print(f"[{name}] FEHLER beim Schreiben: {e}")
-            
+
             # Logs abonnieren
             try:
                 await client.subscribe_logs(on_log, log_level=LogLevel.LOG_LEVEL_VERBOSE)
@@ -138,7 +156,7 @@ async def log_device(device_config):
                 result = client.subscribe_logs(on_log, log_level=LogLevel.LOG_LEVEL_VERBOSE)
                 if asyncio.iscoroutine(result):
                     await result
-            
+
             # Startup-Log
             try:
                 now = datetime.now(LOCAL_TZ)
@@ -148,88 +166,104 @@ async def log_device(device_config):
                 print(f"[{name}] Aktuelle lokale Zeit: {now.strftime('%Y-%m-%d %H:%M:%S')}")
             except Exception as e:
                 print(f"[{name}] FEHLER: Kann nicht in {log_file} schreiben: {e}")
-            
-            # Verbindung halten
-            while True:
-                await asyncio.sleep(1)
-                
+
+            # Warte bis das Gerät die Verbindung trennt (OTA, Neustart, etc.)
+            # VORHER: `while True: await asyncio.sleep(1)` – hat Verbindungstrennung NICHT erkannt!
+            # JETZT:  disconnected_event wird durch on_disconnect() gesetzt → sauberer Reconnect
+            await disconnected_event.wait()
+
+            # Kurze Wartezeit damit das Gerät nach dem Flash/Neustart
+            # Zeit hat hochzufahren, bevor wir reconnecten
+            print(f"[{name}] Warte {reconnect_delay}s vor Reconnect (Gerät startet ggf. neu)...")
+            await asyncio.sleep(reconnect_delay)
+
         except APIConnectionError as e:
             error_msg = str(e)
-            
+
             if "Already connected" in error_msg:
                 print(f"[{name}] Verbindung besteht bereits, warte länger vor erneutem Versuch...")
-                reconnect_delay = 30  # Längere Wartezeit bei "Already connected"
+                reconnect_delay = 30
             else:
                 print(f"[{name}] Verbindungsfehler: {e}")
-            
+
             print(f"[{name}] Versuche Reconnect in {reconnect_delay} Sekunden...")
-            
-            # Cleanup der alten Verbindung
+
             if client:
                 try:
                     await client.disconnect()
-                    await asyncio.sleep(2)  # Warte etwas nach Disconnect
-                except:
+                    await asyncio.sleep(2)
+                except Exception:
                     pass
                 client = None
-            
+
             await asyncio.sleep(reconnect_delay)
-            reconnect_delay = min(reconnect_delay * 1.2, 60)  # Langsamer Backoff
-            
+            reconnect_delay = min(reconnect_delay * 1.2, 60)
+
         except TypeError as e:
             if "functools.partial" in str(e):
                 print(f"[{name}] API-Kompatibilitätsproblem: {e}")
                 print(f"[{name}] Versuche Reconnect in {reconnect_delay} Sekunden...")
-                
+
                 if client:
                     try:
                         await client.disconnect()
                         await asyncio.sleep(2)
-                    except:
+                    except Exception:
                         pass
                     client = None
-                
+
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 1.5, 60)
             else:
                 raise
-                
+
         except Exception as e:
             print(f"[{name}] Unerwarteter Fehler: {e}")
             print(f"[{name}] Typ: {type(e).__name__}")
             import traceback
             print(f"[{name}] Traceback:\n{traceback.format_exc()}")
             print(f"[{name}] Versuche Reconnect in {reconnect_delay} Sekunden...")
-            
+
             if client:
                 try:
                     await client.disconnect()
                     await asyncio.sleep(2)
-                except:
+                except Exception:
                     pass
                 client = None
-            
+
             await asyncio.sleep(reconnect_delay)
             reconnect_delay = min(reconnect_delay * 1.5, 60)
 
+        finally:
+            # Sicherstellen dass der Client immer sauber getrennt wird
+            if client:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                client = None
+
+
 async def main():
     devices = config.get("devices", [])
-    
+
     if not devices:
         print("FEHLER: Keine Geräte konfiguriert!")
         return
-    
+
     print(f"Starte Logger für {len(devices)} Gerät(e)...")
     print(f"Log-Verzeichnis: {LOG_DIR}")
     print(f"Log-Rotation: max {MAX_LOG_LINES} Zeilen ODER {MAX_LOG_SIZE} bytes")
     print(f"Backup-Anzahl: {MAX_BACKUPS}")
-    
+
     if not Path("/share").exists():
         print("WARNUNG: /share Verzeichnis nicht gefunden!")
         print("Stelle sicher dass 'map: [\"share:rw\"]' in config.yaml vorhanden ist!")
-    
+
     tasks = [log_device(device) for device in devices]
     await asyncio.gather(*tasks)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
